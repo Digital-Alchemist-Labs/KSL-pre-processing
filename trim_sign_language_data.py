@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""
+Korean Sign Language (KSL) Data Preprocessing Script
+Trims sign language keypoint data by removing 10 frames before action start and 10 frames after action end.
+Only processes Front (F) view data.
+"""
+
+import json
+import os
+import shutil
+from pathlib import Path
+from typing import Dict, List, Tuple
+import glob
+
+
+def load_morpheme_data(morpheme_path: str) -> Tuple[float, float, float]:
+    """
+    Load morpheme JSON file to get action start and end times.
+    
+    Args:
+        morpheme_path: Path to morpheme JSON file
+        
+    Returns:
+        Tuple of (start_time, end_time, duration)
+    """
+    with open(morpheme_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    start_time = data['data'][0]['start']
+    end_time = data['data'][0]['end']
+    duration = data['metaData']['duration']
+    
+    return start_time, end_time, duration
+
+
+def get_frame_range(start_time: float, end_time: float, duration: float, 
+                    total_frames: int, offset: int = 10) -> Tuple[int, int]:
+    """
+    Calculate frame range to keep based on action timing.
+    
+    Args:
+        start_time: Action start time in seconds
+        end_time: Action end time in seconds
+        duration: Total video duration in seconds
+        total_frames: Total number of frames
+        offset: Number of frames to trim before start and after end
+        
+    Returns:
+        Tuple of (start_frame, end_frame) to keep
+    """
+    fps = total_frames / duration
+    
+    start_frame = int(start_time * fps) - offset
+    end_frame = int(end_time * fps) + offset
+    
+    # Ensure frames are within valid range
+    start_frame = max(0, start_frame)
+    end_frame = min(total_frames - 1, end_frame)
+    
+    return start_frame, end_frame
+
+
+def process_sign_folder(keypoint_folder: str, morpheme_folder: str, 
+                       output_base: str, dry_run: bool = False) -> Dict:
+    """
+    Process a single sign language folder (F view only).
+    
+    Args:
+        keypoint_folder: Path to folder containing keypoint JSON files
+        morpheme_folder: Path to folder containing morpheme JSON files
+        output_base: Base output directory
+        dry_run: If True, only report what would be done without copying
+        
+    Returns:
+        Dictionary with processing statistics
+    """
+    folder_name = os.path.basename(keypoint_folder)
+    
+    # Only process F (Front) view data
+    if '_F' not in folder_name:
+        return {'skipped': True, 'reason': 'Not F view'}
+    
+    # Find corresponding morpheme file
+    morpheme_file = os.path.join(morpheme_folder, f"{folder_name}_morpheme.json")
+    
+    if not os.path.exists(morpheme_file):
+        return {'error': f"Morpheme file not found: {morpheme_file}"}
+    
+    # Get all keypoint files
+    keypoint_files = sorted(glob.glob(os.path.join(keypoint_folder, "*_keypoints.json")))
+    total_frames = len(keypoint_files)
+    
+    if total_frames == 0:
+        return {'error': "No keypoint files found"}
+    
+    # Load morpheme data
+    try:
+        start_time, end_time, duration = load_morpheme_data(morpheme_file)
+    except Exception as e:
+        return {'error': f"Error loading morpheme data: {e}"}
+    
+    # Calculate frame range
+    start_frame, end_frame = get_frame_range(start_time, end_time, duration, total_frames)
+    frames_to_keep = end_frame - start_frame + 1
+    
+    # Create output directory
+    output_folder = os.path.join(output_base, folder_name)
+    
+    if not dry_run:
+        os.makedirs(output_folder, exist_ok=True)
+    
+    # Copy selected frames
+    copied_count = 0
+    for i, frame_idx in enumerate(range(start_frame, end_frame + 1)):
+        src_file = keypoint_files[frame_idx]
+        
+        if not dry_run:
+            # Create new filename with sequential numbering
+            base_name = os.path.basename(src_file)
+            parts = base_name.split('_')
+            # Replace frame number with new sequential number
+            parts[-2] = f"{i:012d}"
+            new_name = '_'.join(parts)
+            
+            dst_file = os.path.join(output_folder, new_name)
+            shutil.copy2(src_file, dst_file)
+        
+        copied_count += 1
+    
+    return {
+        'success': True,
+        'folder': folder_name,
+        'total_frames': total_frames,
+        'start_frame': start_frame,
+        'end_frame': end_frame,
+        'kept_frames': frames_to_keep,
+        'trimmed_frames': total_frames - frames_to_keep,
+        'start_time': start_time,
+        'end_time': end_time
+    }
+
+
+def process_dataset(data_root: str, output_base: str, dry_run: bool = False, 
+                   error_log_path: str = None):
+    """
+    Process entire dataset.
+    
+    Args:
+        data_root: Root directory of the dataset
+        output_base: Output directory for processed data
+        dry_run: If True, only report what would be done
+        error_log_path: Path to save error log file
+    """
+    keypoint_base = os.path.join(data_root, "Training", "Labeled", "REAL", "WORD")
+    morpheme_base = os.path.join(keypoint_base, "morpheme")
+    
+    # Find all numbered folders (01, 02, 03, etc.)
+    numbered_folders = sorted([d for d in os.listdir(keypoint_base) 
+                              if os.path.isdir(os.path.join(keypoint_base, d)) 
+                              and d.isdigit()])
+    
+    print(f"Found {len(numbered_folders)} numbered folders to process")
+    print(f"{'=' * 80}")
+    
+    all_stats = []
+    success_count = 0
+    skip_count = 0
+    error_count = 0
+    error_list = []
+    
+    for folder_num in numbered_folders:
+        keypoint_folder_base = os.path.join(keypoint_base, folder_num)
+        morpheme_folder = os.path.join(morpheme_base, folder_num)
+        
+        if not os.path.exists(morpheme_folder):
+            print(f"Warning: Morpheme folder not found for {folder_num}")
+            continue
+        
+        # Find all F view folders in this numbered folder
+        all_folders = sorted([d for d in os.listdir(keypoint_folder_base)
+                            if os.path.isdir(os.path.join(keypoint_folder_base, d))])
+        
+        f_folders = [f for f in all_folders if '_F' in f]
+        
+        print(f"\nProcessing folder {folder_num}: {len(f_folders)} F-view folders")
+        
+        for folder in f_folders:
+            keypoint_folder = os.path.join(keypoint_folder_base, folder)
+            output_folder_base = os.path.join(output_base, folder_num)
+            
+            result = process_sign_folder(keypoint_folder, morpheme_folder, 
+                                        output_folder_base, dry_run)
+            
+            if result.get('skipped'):
+                skip_count += 1
+            elif result.get('error'):
+                error_count += 1
+                error_msg = f"{folder}: {result['error']}"
+                error_list.append(error_msg)
+                print(f"  ✗ Error processing {error_msg}")
+            elif result.get('success'):
+                success_count += 1
+                all_stats.append(result)
+                print(f"  ✓ {result['folder']}: "
+                      f"{result['total_frames']} → {result['kept_frames']} frames "
+                      f"(trimmed {result['trimmed_frames']})")
+    
+    print(f"\n{'=' * 80}")
+    print(f"Processing complete!")
+    print(f"  Success: {success_count}")
+    print(f"  Skipped: {skip_count}")
+    print(f"  Errors:  {error_count}")
+    
+    if all_stats:
+        total_original = sum(s['total_frames'] for s in all_stats)
+        total_kept = sum(s['kept_frames'] for s in all_stats)
+        total_trimmed = sum(s['trimmed_frames'] for s in all_stats)
+        
+        print(f"\nTotal Statistics:")
+        print(f"  Original frames: {total_original:,}")
+        print(f"  Kept frames:     {total_kept:,}")
+        print(f"  Trimmed frames:  {total_trimmed:,}")
+        print(f"  Reduction:       {(total_trimmed/total_original*100):.1f}%")
+    
+    # Save error log if requested
+    if error_log_path and error_list:
+        with open(error_log_path, 'w', encoding='utf-8') as f:
+            f.write(f"Korean Sign Language Data Preprocessing - Error Log\n")
+            f.write(f"{'=' * 80}\n")
+            f.write(f"Total errors: {len(error_list)}\n\n")
+            for error in error_list:
+                f.write(f"{error}\n")
+        print(f"\nError log saved to: {error_log_path}")
+
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='Trim Korean Sign Language keypoint data (F view only)')
+    parser.add_argument('--data-root', 
+                       default='/Users/jaylee_83/Documents/_D-ALabs/Data_Sets/SignLanguageSets',
+                       help='Root directory of the dataset')
+    parser.add_argument('--output', 
+                       default='/Users/jaylee_83/Documents/_D-ALabs/Data_Sets/SignLanguageSets_Trimmed',
+                       help='Output directory for trimmed data')
+    parser.add_argument('--dry-run', action='store_true',
+                       help='Show what would be done without actually copying files')
+    parser.add_argument('--error-log',
+                       default='preprocessing_errors.log',
+                       help='Path to save error log file (default: preprocessing_errors.log)')
+    
+    args = parser.parse_args()
+    
+    print("Korean Sign Language Data Preprocessing")
+    print(f"Data root: {args.data_root}")
+    print(f"Output:    {args.output}")
+    print(f"Mode:      {'DRY RUN' if args.dry_run else 'PROCESSING'}")
+    print()
+    
+    if not os.path.exists(args.data_root):
+        print(f"Error: Data root directory not found: {args.data_root}")
+        return
+    
+    if not args.dry_run:
+        os.makedirs(args.output, exist_ok=True)
+    
+    process_dataset(args.data_root, args.output, args.dry_run, args.error_log)
+
+
+if __name__ == '__main__':
+    main()
+

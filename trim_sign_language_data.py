@@ -11,6 +11,29 @@ import shutil
 from pathlib import Path
 from typing import Dict, List, Tuple
 import glob
+import logging
+from datetime import datetime
+from tqdm import tqdm
+import multiprocessing as mp
+from functools import partial
+
+
+# Configure logging
+def setup_logging(log_file: str = None):
+    """Setup logging configuration."""
+    log_format = '%(asctime)s - %(levelname)s - %(message)s'
+    
+    if log_file:
+        logging.basicConfig(
+            level=logging.INFO,
+            format=log_format,
+            handlers=[
+                logging.FileHandler(log_file, encoding='utf-8'),
+                logging.StreamHandler()
+            ]
+        )
+    else:
+        logging.basicConfig(level=logging.INFO, format=log_format)
 
 
 def load_morpheme_data(morpheme_path: str) -> Tuple[float, float, float]:
@@ -80,11 +103,36 @@ def process_sign_folder(keypoint_folder: str, morpheme_folder: str,
     if '_F' not in folder_name:
         return {'skipped': True, 'reason': 'Not F view'}
     
-    # Find corresponding morpheme file
-    morpheme_file = os.path.join(morpheme_folder, f"{folder_name}_morpheme.json")
+    # Extract WORD number and view direction from folder name
+    # Example: NIA_SL_WORD0001_REAL02_F -> WORD0001, F
+    parts = folder_name.split('_')
+    word_num = None
+    view_dir = None
     
-    if not os.path.exists(morpheme_file):
-        return {'error': f"Morpheme file not found: {morpheme_file}"}
+    for part in parts:
+        if part.startswith('WORD'):
+            word_num = part
+        if part in ['F', 'D', 'L', 'R', 'U']:
+            view_dir = part
+    
+    if not word_num or not view_dir:
+        return {'error': f"Cannot parse folder name: {folder_name}"}
+    
+    # Find corresponding morpheme file using flexible pattern
+    # Pattern: NIA_SL_WORD0001_REAL*_F_morpheme.json
+    morpheme_pattern = os.path.join(morpheme_folder, f"NIA_SL_{word_num}_REAL*_{view_dir}_morpheme.json")
+    morpheme_files = glob.glob(morpheme_pattern)
+    
+    if not morpheme_files:
+        return {'error': f"Morpheme file not found with pattern: {morpheme_pattern}"}
+    
+    # Use the first matching file
+    morpheme_file = morpheme_files[0]
+    
+    # If multiple files found, log a warning but continue with the first one
+    if len(morpheme_files) > 1:
+        # Just use the first one silently
+        pass
     
     # Get all keypoint files
     keypoint_files = sorted(glob.glob(os.path.join(keypoint_folder, "*_keypoints.json")))
@@ -140,8 +188,15 @@ def process_sign_folder(keypoint_folder: str, morpheme_folder: str,
     }
 
 
+def process_single_folder_wrapper(args):
+    """Wrapper function for multiprocessing."""
+    keypoint_folder, morpheme_folder, output_folder_base, dry_run = args
+    return process_sign_folder(keypoint_folder, morpheme_folder, output_folder_base, dry_run)
+
+
 def process_dataset(data_root: str, output_base: str, dry_run: bool = False, 
-                   error_log_path: str = None):
+                   error_log_path: str = None, use_multiprocessing: bool = False,
+                   num_workers: int = None):
     """
     Process entire dataset.
     
@@ -150,6 +205,8 @@ def process_dataset(data_root: str, output_base: str, dry_run: bool = False,
         output_base: Output directory for processed data
         dry_run: If True, only report what would be done
         error_log_path: Path to save error log file
+        use_multiprocessing: If True, use multiprocessing for parallel processing
+        num_workers: Number of worker processes (defaults to CPU count)
     """
     keypoint_base = os.path.join(data_root, "Training", "Labeled", "REAL", "WORD")
     morpheme_base = os.path.join(keypoint_base, "morpheme")
@@ -159,7 +216,7 @@ def process_dataset(data_root: str, output_base: str, dry_run: bool = False,
                               if os.path.isdir(os.path.join(keypoint_base, d)) 
                               and d.isdigit()])
     
-    print(f"Found {len(numbered_folders)} numbered folders to process")
+    logging.info(f"Found {len(numbered_folders)} numbered folders to process: {', '.join(numbered_folders)}")
     print(f"{'=' * 80}")
     
     all_stats = []
@@ -168,42 +225,72 @@ def process_dataset(data_root: str, output_base: str, dry_run: bool = False,
     error_count = 0
     error_list = []
     
+    # Collect all folders to process
+    all_tasks = []
     for folder_num in numbered_folders:
         keypoint_folder_base = os.path.join(keypoint_base, folder_num)
         morpheme_folder = os.path.join(morpheme_base, folder_num)
         
         if not os.path.exists(morpheme_folder):
-            print(f"Warning: Morpheme folder not found for {folder_num}")
+            logging.warning(f"Morpheme folder not found for {folder_num}")
+            continue
+        
+        if not os.path.exists(keypoint_folder_base):
+            logging.warning(f"Keypoint folder not found: {keypoint_folder_base}")
             continue
         
         # Find all F view folders in this numbered folder
-        all_folders = sorted([d for d in os.listdir(keypoint_folder_base)
-                            if os.path.isdir(os.path.join(keypoint_folder_base, d))])
+        try:
+            all_folders = sorted([d for d in os.listdir(keypoint_folder_base)
+                                if os.path.isdir(os.path.join(keypoint_folder_base, d))])
+        except Exception as e:
+            logging.error(f"Error listing folder {keypoint_folder_base}: {e}")
+            continue
         
         f_folders = [f for f in all_folders if '_F' in f]
         
-        print(f"\nProcessing folder {folder_num}: {len(f_folders)} F-view folders")
+        logging.info(f"Folder {folder_num}: {len(f_folders)} F-view folders found")
         
         for folder in f_folders:
             keypoint_folder = os.path.join(keypoint_folder_base, folder)
             output_folder_base = os.path.join(output_base, folder_num)
-            
-            result = process_sign_folder(keypoint_folder, morpheme_folder, 
-                                        output_folder_base, dry_run)
-            
-            if result.get('skipped'):
-                skip_count += 1
-            elif result.get('error'):
-                error_count += 1
-                error_msg = f"{folder}: {result['error']}"
-                error_list.append(error_msg)
-                print(f"  ✗ Error processing {error_msg}")
-            elif result.get('success'):
-                success_count += 1
-                all_stats.append(result)
-                print(f"  ✓ {result['folder']}: "
-                      f"{result['total_frames']} → {result['kept_frames']} frames "
-                      f"(trimmed {result['trimmed_frames']})")
+            all_tasks.append((keypoint_folder, morpheme_folder, output_folder_base, dry_run))
+    
+    logging.info(f"Total {len(all_tasks)} F-view folders to process")
+    
+    # Process all tasks
+    if use_multiprocessing and not dry_run:
+        if num_workers is None:
+            num_workers = max(1, mp.cpu_count() - 1)
+        
+        logging.info(f"Using multiprocessing with {num_workers} workers")
+        
+        with mp.Pool(num_workers) as pool:
+            results = list(tqdm(
+                pool.imap(process_single_folder_wrapper, all_tasks),
+                total=len(all_tasks),
+                desc="Processing folders",
+                unit="folder"
+            ))
+    else:
+        # Sequential processing with progress bar
+        results = []
+        for task in tqdm(all_tasks, desc="Processing folders", unit="folder"):
+            results.append(process_single_folder_wrapper(task))
+    
+    # Collect results
+    for result in results:
+        if result.get('skipped'):
+            skip_count += 1
+        elif result.get('error'):
+            error_count += 1
+            folder_name = result.get('folder', 'Unknown')
+            error_msg = f"{folder_name}: {result['error']}"
+            error_list.append(error_msg)
+            logging.error(f"Error processing {error_msg}")
+        elif result.get('success'):
+            success_count += 1
+            all_stats.append(result)
     
     print(f"\n{'=' * 80}")
     print(f"Processing complete!")
@@ -226,18 +313,35 @@ def process_dataset(data_root: str, output_base: str, dry_run: bool = False,
     if error_log_path and error_list:
         with open(error_log_path, 'w', encoding='utf-8') as f:
             f.write(f"Korean Sign Language Data Preprocessing - Error Log\n")
+            f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"{'=' * 80}\n")
             f.write(f"Total errors: {len(error_list)}\n\n")
             for error in error_list:
                 f.write(f"{error}\n")
-        print(f"\nError log saved to: {error_log_path}")
+        logging.info(f"Error log saved to: {error_log_path}")
 
 
 def main():
     import argparse
     
     parser = argparse.ArgumentParser(
-        description='Trim Korean Sign Language keypoint data (F view only)')
+        description='Trim Korean Sign Language keypoint data (F view only)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Dry run to see what would be processed
+  python trim_sign_language_data.py --dry-run
+  
+  # Process with default settings
+  python trim_sign_language_data.py
+  
+  # Process with multiprocessing (faster)
+  python trim_sign_language_data.py --multiprocessing --workers 4
+  
+  # Process with custom paths
+  python trim_sign_language_data.py --data-root /path/to/data --output /path/to/output
+        """)
+    
     parser.add_argument('--data-root', 
                        default='/Users/jaylee_83/Documents/_D-ALabs/Data_Sets/SignLanguageSets',
                        help='Root directory of the dataset')
@@ -249,23 +353,67 @@ def main():
     parser.add_argument('--error-log',
                        default='preprocessing_errors.log',
                        help='Path to save error log file (default: preprocessing_errors.log)')
+    parser.add_argument('--multiprocessing', action='store_true',
+                       help='Use multiprocessing for parallel processing (faster)')
+    parser.add_argument('--workers', type=int, default=None,
+                       help='Number of worker processes (default: CPU count - 1)')
+    parser.add_argument('--log-file',
+                       default='preprocessing.log',
+                       help='Path to save processing log file (default: preprocessing.log)')
     
     args = parser.parse_args()
     
+    # Setup logging
+    setup_logging(args.log_file if not args.dry_run else None)
+    
+    print("=" * 80)
     print("Korean Sign Language Data Preprocessing")
-    print(f"Data root: {args.data_root}")
-    print(f"Output:    {args.output}")
-    print(f"Mode:      {'DRY RUN' if args.dry_run else 'PROCESSING'}")
+    print("=" * 80)
+    print(f"Data root:      {args.data_root}")
+    print(f"Output:         {args.output}")
+    print(f"Mode:           {'DRY RUN' if args.dry_run else 'PROCESSING'}")
+    print(f"Multiprocessing: {'Enabled' if args.multiprocessing else 'Disabled'}")
+    if args.multiprocessing and args.workers:
+        print(f"Workers:        {args.workers}")
+    print(f"Log file:       {args.log_file}")
+    print(f"Error log:      {args.error_log}")
     print()
     
     if not os.path.exists(args.data_root):
+        logging.error(f"Data root directory not found: {args.data_root}")
         print(f"Error: Data root directory not found: {args.data_root}")
+        return
+    
+    # Verify WORD directory exists
+    word_dir = os.path.join(args.data_root, "Training", "Labeled", "REAL", "WORD")
+    if not os.path.exists(word_dir):
+        logging.error(f"WORD directory not found: {word_dir}")
+        print(f"Error: WORD directory not found: {word_dir}")
         return
     
     if not args.dry_run:
         os.makedirs(args.output, exist_ok=True)
+        logging.info(f"Output directory created/verified: {args.output}")
     
-    process_dataset(args.data_root, args.output, args.dry_run, args.error_log)
+    # Log start time
+    start_time = datetime.now()
+    logging.info(f"Processing started at {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    process_dataset(
+        args.data_root, 
+        args.output, 
+        args.dry_run, 
+        args.error_log,
+        args.multiprocessing,
+        args.workers
+    )
+    
+    # Log end time and duration
+    end_time = datetime.now()
+    duration = end_time - start_time
+    logging.info(f"Processing completed at {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logging.info(f"Total duration: {duration}")
+    print(f"\nTotal processing time: {duration}")
 
 
 if __name__ == '__main__':

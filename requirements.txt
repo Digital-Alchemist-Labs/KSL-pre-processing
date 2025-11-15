@@ -1,3 +1,4 @@
-# No external dependencies required
-# This script uses only Python standard library
+# Korean Sign Language Data Preprocessing Dependencies
 
+# Progress bar for visual feedback
+tqdm>=4.65.0
